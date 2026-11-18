@@ -1,6 +1,8 @@
 //! GPU boids: `cargo run --release -- [count] [--novsync]`
 
-use std::{fmt, sync::Arc, time::Instant};
+mod flint;
+
+use std::{fmt, ops::RangeInclusive, sync::Arc, time::Instant};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, KeyEvent, WindowEvent},
@@ -210,6 +212,7 @@ impl Gpu {
         let draw = bind(&render.get_bind_group_layout(0), &[(0, &params_buf), (4, &boids_buf)]);
 
         let egui = egui::Context::default();
+        flint::apply(&egui);
         let egui_state = egui_winit::State::new(
             egui.clone(),
             egui::ViewportId::ROOT,
@@ -327,7 +330,7 @@ impl Gpu {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.01, g: 0.01, b: 0.02, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(page(self.config.format)),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -363,29 +366,105 @@ impl Gpu {
     }
 }
 
-/// Tuning panel, top right. Sets `reset` when the reset button is clicked.
+/// Flint `surface`, the page the panel is raised from, as a clear color for `format`.
+fn page(format: wgpu::TextureFormat) -> wgpu::Color {
+    let [r, g, b, _] = if format.is_srgb() {
+        egui::Rgba::from(flint::SURFACE).to_array() // the surface encodes, so clear in linear
+    } else {
+        flint::SURFACE.to_array().map(|c| c as f32 / 255.0)
+    };
+    wgpu::Color { r: r as f64, g: g as f64, b: b as f64, a: 1.0 }
+}
+
+/// How a `row` spreads and prints its value.
+#[derive(PartialEq)]
+enum Scale {
+    Linear,
+    Log,
+    /// Linear, with 0 shown as "Off".
+    ZeroOff,
+}
+
+/// One parameter: mono label, slider rail, editable value well.
+fn row(ui: &mut egui::Ui, name: &str, v: &mut f32, range: RangeInclusive<f32>, kind: Scale) {
+    const LABEL_W: f32 = 96.0;
+    ui.horizontal(|ui| {
+        let label = ui.label(flint::label(name));
+        ui.add_space(LABEL_W - label.rect.width());
+        ui.add(egui::Slider::new(v, range.clone()).logarithmic(kind == Scale::Log).show_value(false));
+        let speed = (range.end() - range.start()) * 0.005;
+        let mut value = egui::DragValue::new(v).range(range).speed(speed).fixed_decimals(2);
+        if kind == Scale::ZeroOff {
+            value = value.custom_formatter(|x, _| if x == 0.0 { "Off".into() } else { format!("{x:.2}") });
+        }
+        ui.add(value);
+    });
+}
+
+/// Tuning panel, top right: a Flint raised card. Sets `reset` when "Reseed boids" is clicked.
 fn panel(ctx: &egui::Context, t: &mut Tune, scale: &mut f32, reset: &mut bool) {
-    use egui::Slider;
-    egui::Window::new("params").anchor(egui::Align2::RIGHT_TOP, [-8.0, 8.0]).resizable(false).show(ctx, |ui| {
-        ui.add(Slider::new(&mut t.w_sep, 0.0..=10.0).text("separation"));
-        ui.add(Slider::new(&mut t.w_ali, 0.0..=10.0).text("alignment"));
-        ui.add(Slider::new(&mut t.w_coh, 0.0..=10.0).text("cohesion"));
-        ui.add(Slider::new(&mut t.sep_r, 0.05..=1.0).text("sep radius"));
-        ui.add(Slider::new(scale, 0.25..=4.0).logarithmic(true).text("radius ×"));
-        ui.add(Slider::new(&mut t.noise, 0.0..=5.0).text("noise"));
-        ui.add(Slider::new(&mut t.max_acc, 0.0..=5.0).text("max accel (0 = off)"));
-        let hi = t.max_speed;
-        ui.add(Slider::new(&mut t.min_speed, 0.0..=hi).text("min speed"));
-        let lo = t.min_speed;
-        ui.add(Slider::new(&mut t.max_speed, lo.max(0.01)..=1.0).text("max speed"));
-        ui.horizontal(|ui| {
-            *reset |= ui.button("reset").clicked();
-            if ui.button("defaults").clicked() {
-                *t = Tune::default();
-                *scale = 1.0;
-            }
+    use egui::{Align, Color32, Frame, Layout, Margin, RichText, Separator, Stroke};
+    use flint::*;
+    const W: f32 = 352.0;
+    let open_id = egui::Id::unique("panel open");
+    let mut open = ctx.data(|d| d.get_temp(open_id)).unwrap_or(true);
+    let rule = |ui: &mut egui::Ui| ui.add(Separator::default().spacing(BORDER_1));
+    let card = Frame::new().fill(SURFACE_RAISED).stroke(Stroke::new(BORDER_1, STROKE));
+    egui::Area::new(egui::Id::unique("params")).anchor(egui::Align2::RIGHT_TOP, [-SPACE_4, SPACE_4]).show(ctx, |ui| {
+        card.show(ui, |ui| {
+            ui.set_width(W);
+            ui.spacing_mut().item_spacing.y = 0.0; // sections share one rule
+            Frame::new().inner_margin(Margin::same(16)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Parameters").heading().color(INK));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // ghost button: no edge, muted until hovered
+                        let w = &mut ui.visuals_mut().widgets;
+                        w.inactive.bg_stroke.color = Color32::TRANSPARENT;
+                        w.hovered.bg_stroke.color = Color32::TRANSPARENT;
+                        w.inactive.fg_stroke.color = INK_MUTED;
+                        open ^= ui.button(if open { "Hide" } else { "Show" }).clicked();
+                    });
+                });
+            });
+            if !open { return; }
+            rule(ui);
+            Frame::new().inner_margin(Margin::same(16)).show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(SPACE_3, SPACE_1);
+                ui.spacing_mut().slider_width = W - 2.0 * SPACE_4 - 96.0 - 56.0 - 2.0 * SPACE_3;
+                let w = &mut ui.visuals_mut().widgets;
+                w.inactive.fg_stroke.width = 0.0; // handle at rest: a block of the rail, no bright edge
+                for s in [&mut w.inactive, &mut w.hovered, &mut w.active] {
+                    s.weak_bg_fill = SURFACE_SUNKEN; // value wells
+                }
+                w.hovered.bg_stroke.color = INK_SUBTLE;
+                row(ui, "Separation", &mut t.w_sep, 0.0..=10.0, Scale::Linear);
+                row(ui, "Alignment", &mut t.w_ali, 0.0..=10.0, Scale::Linear);
+                row(ui, "Cohesion", &mut t.w_coh, 0.0..=10.0, Scale::Linear);
+                row(ui, "Sep radius", &mut t.sep_r, 0.05..=1.0, Scale::Linear);
+                row(ui, "Radius scale", scale, 0.25..=4.0, Scale::Log);
+                row(ui, "Noise", &mut t.noise, 0.0..=5.0, Scale::Linear);
+                row(ui, "Max accel", &mut t.max_acc, 0.0..=5.0, Scale::ZeroOff);
+                let hi = t.max_speed;
+                row(ui, "Min speed", &mut t.min_speed, 0.0..=hi, Scale::Linear);
+                let lo = t.min_speed;
+                row(ui, "Max speed", &mut t.max_speed, lo.max(0.01)..=1.0, Scale::Linear);
+            });
+            rule(ui);
+            Frame::new().inner_margin(Margin::symmetric(16, 12)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        *reset |= ui.button("Reset").clicked();
+                        if ui.button("Defaults").clicked() {
+                            *t = Tune::default();
+                            *scale = 1.0;
+                        }
+                    });
+                });
+            });
         });
     });
+    ctx.data_mut(|d| d.insert_temp(open_id, open));
 }
 
 /// Random positions and headings from a xorshift PRNG; returns flat [px, py, vx, vy] per boid.
